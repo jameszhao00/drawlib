@@ -1,3 +1,10 @@
 /src/drawlib/*.suo
 packages/
-/src/drawlib/drawlib/*.dll
+*.dll
+*.pdb
+*.exe
+/src/drawlib/drawlib/bin/Debug/*.xml
+/src/drawlib/drawlib/bin/Debug/*.config
+/src/drawlib/drawlib/bin/Debug/*.fx
+/src/drawlib/drawlib/obj/Debug/*.txt
+/src/drawlib/drawlib/obj/Debug/*.cache
