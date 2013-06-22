@@ -10,26 +10,38 @@ open SharpDX.Direct3D11
 open SharpDX.DXGI
 open SharpDX.Windows
 open Assimp
+        
+                                 
+module lib3d = 
+    type vec4 = {x:float32; y:float32; z:float32; w:float32}
+    type vec3 = {x:float32; y:float32; z:float32}
+    type View = {Eye:vec3; Forward:vec3; Up:vec3}
+    type Proj = {Fov:float32; AR:float32; ZNear:float32; ZFar:float32}
+   
+    let toNativeVec3 ({vec3.x=x; y=y; z=z}) = new Vector3(x,y,z)
+    let toNativeVec4 ({vec4.x=x; y=y; z=z; w=w}) = new Vector4(x,y,z,w)
+    let view {Eye=eye; Forward=forward; Up=up} = 
+        Matrix.LookAtLH(toNativeVec3(eye), Vector3.Add(toNativeVec3(eye), toNativeVec3(forward)), toNativeVec3(up))
+    let proj {Fov=fov; AR=ar; ZNear=zNear; ZFar=zFar} = Matrix.PerspectiveFovLH(fov, ar, zNear, zFar)
+    let viewProj viewData projData = Matrix.Multiply((view viewData), (proj projData))
+    
 module assets = 
-    type vec3 = float32 * float32 * float32
+    open lib3d
     type Geometry = { Indices: uint32[]; Vertices : vec3[] }
 
     let objAsset path = 
         let importer = new AssimpImporter()        
         let importedAsset = importer.ImportFile(path, PostProcessSteps.PreTransformVertices 
-            ||| PostProcessSteps.Triangulate
-            ||| PostProcessSteps.FlipWindingOrder)        
+            ||| PostProcessSteps.Triangulate)        
         importedAsset.Meshes 
         |> Array.map (
             fun mesh -> 
                 {Vertices = mesh.Vertices 
                     |> Array.map (
-                        fun vertices -> (vertices.X, vertices.Y, vertices.Z));
+                        fun vertices -> {x=vertices.X;y=vertices.Y;z=vertices.Z});
                     Indices = mesh.GetIndices()})
-        
-                                 
-        
-module lib3d = 
+module d3d = 
+    open lib3d
     type VsInputElement = { 
         Name: string; 
         Index : int;
@@ -37,10 +49,9 @@ module lib3d =
         AlignedByteOffset : int;
         Slot : int;
     }
-    type vec4 = float32*float32*float32*float32    
     type VertexBuffer = { DxBuffer : Buffer; Stride: int32; Offset: int32; VertexCount : int32 }
     type IndexBuffer = { DxBuffer: Buffer; Stride: int32; Offset: Int32; IndicesCount: int32; Format : Format }
-    
+    type CBuffer = { DxBuffer: Buffer; }
     type VSByteCode = VSByteCode of byte[]
     type PSByteCode = PSByteCode of byte[]
 
@@ -52,7 +63,7 @@ module lib3d =
 
     let size (window : System.Windows.Forms.Form) = 
         (window.ClientSize.Width, window.ClientSize.Height)
-
+    
     let swapChainDesc window = 
         let (w, h) = size window
         let modeDesc = new ModeDescription(w, h, new Rational(60, 1), Format.R8G8B8A8_UNorm)
@@ -97,7 +108,7 @@ module lib3d =
 
 
     let triVertexBuffer device (vertices:vec4[][]) (indices:uint32[])= 
-        let toSDXVec4 (x,y,z,w) = new Vector4(x,y,z,w)
+        let toSDXVec4 {x=x;y=y;z=z;w=w;} = new Vector4(x,y,z,w)
         let flattened = vertices |> Array.collect (fun (els:array<vec4>) -> els |> Array.map toSDXVec4)
         
         let ib = { DxBuffer = Buffer.Create(device, BindFlags.IndexBuffer, indices); 
@@ -111,6 +122,10 @@ module lib3d =
             VertexCount = vertices.Length }
         (ib, vb)
 
+    let cb device size = 
+        {DxBuffer = new Buffer(device, size, ResourceUsage.Default, 
+                                BindFlags.ConstantBuffer, CpuAccessFlags.None, ResourceOptionFlags.None, 0)}
+    
     let prepareInputAssembler (ctx : DeviceContext) layout (vb:VertexBuffer) (ib:IndexBuffer) = 
         ctx.InputAssembler.InputLayout <- layout
         ctx.InputAssembler.PrimitiveTopology <- PrimitiveTopology.TriangleList
@@ -123,23 +138,30 @@ module lib3d =
     let prepareOutputMerger (ctx:DeviceContext) (rtv:RenderTargetView) = 
         ctx.OutputMerger.SetTargets(rtv)
 
+    let updateCb (ctx:DeviceContext) (buf:CBuffer) data = 
+        ctx.UpdateSubresource(ref data, buf.DxBuffer)
+
     let prepareWindow (window:System.Windows.Forms.Form) (device:Direct3D11.Device) (swapChain:SwapChain) = 
         let factory = swapChain.GetParent<Factory>()
         factory.MakeWindowAssociation(window.Handle, WindowAssociationFlags.IgnoreAll)
         let backbuffer = Texture2D.FromSwapChain<Texture2D>(swapChain, 0)
         let backbufferRtv = rtv device backbuffer
         (backbuffer, backbufferRtv)
-    let prepareShaders (ctx : DeviceContext) vs ps =  
-        ctx.VertexShader.Set(vs)
-        ctx.PixelShader.Set(ps)
+
+    let prepareShader setShader setCbs shader (cbs:CBuffer[]) = 
+        setShader shader
+        if cbs.Length > 0 then
+            setCbs (cbs |> Array.map (fun x -> x.DxBuffer))
+
+    let prepareVs (ctx : DeviceContext) vs cbs = 
+        prepareShader ctx.VertexShader.Set (fun x -> ctx.VertexShader.SetConstantBuffers(0, x)) vs cbs
+        
+    let preparePs (ctx : DeviceContext) ps cbs = 
+        prepareShader ctx.PixelShader.Set (fun x -> ctx.PixelShader.SetConstantBuffers(0, x)) ps cbs
         
 
 open lib3d
-let myVertices = [|
-    [|(0.0f, 0.5f, 0.5f, 1.0f); (1.0f, 0.0f, 0.0f, 1.0f)|];
-    [|(0.5f, -0.5f, 0.5f, 1.0f); (0.0f, 1.0f, 0.0f, 1.0f)|];
-    [|(-0.5f, -0.5f, 0.5f, 1.0f); (0.0f, 0.0f, 1.0f, 1.0f)|]
-|]
+open d3d
 
 let myInputElements = [
     {Name = "POSITION"; Index = 0; Format = Format.R32G32B32A32_Float; Slot = 0; AlignedByteOffset = 0};  
@@ -156,23 +178,39 @@ let main argv =
     let (backbuffer, backbufferRtv) = prepareWindow window device swapChain
     let simpleVs, vsByteCode = vs device "MiniTri.fx"
     let simplePs, _ = ps device "MiniTri.fx"
-    let toVec4 (x,y,z) = [|(x,y,z,1.f); (1.f,0.f,1.f,1.f)|]
+    let rand = new Random()
+    let toVertex {vec3.x=x;y=y;z=z} = [|{x=x;y=y;z=z;w=1.f}; {x=(float32 (rand.NextDouble()));y=0.f;z=0.f;w=1.f}|]
     printfn "start making ib, vb"
-    let ibVbs = sphere |> Array.map (fun x -> triVertexBuffer device (x.Vertices |> Array.map toVec4) x.Indices)
+    let ibVbs = sphere |> Array.map (fun x -> triVertexBuffer device (x.Vertices |> Array.map toVertex) x.Indices)
     printfn "end making ib, vb"
     let myLayout = layout device vsByteCode myInputElements 
     let immediateCtx = device.ImmediateContext
     
+    
+    let vpCb = cb device sizeof<Matrix>
+
+
+    let eyeZ = ref -1.f
+
 
     RenderLoop.Run(window, (fun () ->                 
             let clearColor = new Color4(Color.Black.ToColor3())
             immediateCtx.ClearRenderTargetView(backbufferRtv, clearColor)
+            
+            eyeZ := !eyeZ + 0.00001f
+            let v = {Eye={x=0.f;y=0.f;z = !eyeZ}; Forward={x=0.f;y=0.f;z=1.f}; Up={x=0.f;y=1.f;z=0.f}}
+            let p = {ZNear = 0.01f; ZFar = 10.f; AR = 1.f; Fov = SharpDX.MathUtil.PiOverTwo}
+            let vpMat = viewProj v p
+
+            updateCb immediateCtx vpCb vpMat
+
             for (ib, vb) in ibVbs do  
                         
                 prepareInputAssembler immediateCtx myLayout vb ib
                 prepareRasterizer immediateCtx (sizef window) 
                 prepareOutputMerger immediateCtx backbufferRtv
-                prepareShaders immediateCtx simpleVs simplePs
+                prepareVs immediateCtx simpleVs [|vpCb|]
+                preparePs immediateCtx simplePs [||]
 
                 immediateCtx.DrawIndexed(ib.IndicesCount, 0, 0)
             swapChain.Present(0, PresentFlags.None)            
