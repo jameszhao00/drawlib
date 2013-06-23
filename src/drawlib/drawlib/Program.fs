@@ -63,7 +63,7 @@ module assets =
     let objAsset path = 
         let importer = new AssimpImporter()        
         let importedAsset = importer.ImportFile(path, PostProcessSteps.Triangulate
-            ///||| PostProcessSteps.GenerateNormals
+            //||| PostProcessSteps.GenerateNormals
             ||| PostProcessSteps.PreTransformVertices 
             )        
         importedAsset.Meshes 
@@ -99,8 +99,14 @@ module d3d =
 
     let size (window : System.Windows.Forms.Form) = 
         (window.ClientSize.Width, window.ClientSize.Height)
-    
-    let swapChainDesc window = 
+
+    let depthTex (device:SharpDX.Direct3D11.Device) (w, h) (samples:SampleDescription) = 
+        let desc = new Texture2DDescription(Width = w, Height=h, Format=Format.D32_Float,
+                    SampleDescription=samples, Usage=ResourceUsage.Default, BindFlags=BindFlags.DepthStencil, ArraySize=1, MipLevels=1)
+        let tex = new Texture2D(device, desc)
+        tex, new DepthStencilView(device, tex)
+
+    let swapChainDesc window sampleDesc = 
         let (w, h) = size window
         let modeDesc = new ModeDescription(w, h, new Rational(60, 1), Format.R8G8B8A8_UNorm)
         new SwapChainDescription(
@@ -108,22 +114,27 @@ module d3d =
             ModeDescription = modeDesc,
             IsWindowed = sdx_true,
             OutputHandle = window.Handle,
-            SampleDescription = new SampleDescription(8, 0),
+            SampleDescription = sampleDesc,
             SwapEffect = SwapEffect.Discard,
             Usage = Usage.RenderTargetOutput
             )
-    let deviceAndSwapChain window = 
+    let deviceAndSwapChain window sampleDesc = 
         Device.CreateWithSwapChain(
             DriverType.Hardware, 
-            DeviceCreationFlags.None,
-            swapChainDesc window)
+            DeviceCreationFlags.Debug,
+            swapChainDesc window sampleDesc)
 
     let rtv device tex = new RenderTargetView(device, tex)
 
     let shaderByteCode file funcName version = 
         ShaderBytecode.CompileFromFile(file, funcName, version, 
             ShaderFlags.Debug ||| ShaderFlags.SkipOptimization ||| ShaderFlags.SkipOptimization, EffectFlags.None).Bytecode.Data
-
+    let maxDepth = 1.f
+    let clear (ctx : DeviceContext) (rtvs:RenderTargetView[]) (dsv:DepthStencilView) = 
+        ctx.ClearDepthStencilView(dsv, DepthStencilClearFlags.Depth, maxDepth, 0uy)
+        for rtv in rtvs do
+            ctx.ClearRenderTargetView(rtv, new Color4(1.f, 0.f, 1.f, 1.f))
+        
 
     let vs device file = 
         let bytecode = shaderByteCode file "VS" "vs_5_0"
@@ -173,8 +184,11 @@ module d3d =
     let prepareRasterizer (ctx:DeviceContext) (w,h)= 
         ctx.Rasterizer.SetViewport(0.f, 0.f, w, h, 0.f, 1.f)
 
-    let prepareOutputMerger (ctx:DeviceContext) (rtv:RenderTargetView) = 
-        ctx.OutputMerger.SetTargets(rtv)
+    let prepareOutputMerger (ctx:DeviceContext) (rtv:RenderTargetView) (dsv:option<DepthStencilView>) = 
+        match dsv with 
+        | Some x -> ctx.OutputMerger.SetTargets(x, rtv)
+        | None -> ctx.OutputMerger.SetTargets(rtv)
+        
 
     let updateCb (ctx:DeviceContext) (buf:CBuffer) data = 
         ctx.UpdateSubresource(ref data, buf.DxBuffer)
@@ -198,13 +212,13 @@ module d3d =
         prepareShader ctx.PixelShader.Set (fun x -> ctx.PixelShader.SetConstantBuffers(0, x)) ps cbs
 module gfx = 
     open d3d
+
     type Rgba32 = 
         | DxRgba32 of Texture2D*option<RenderTargetView>*option<ShaderResourceView>
     type Rgb32 = 
         | DxRgb32 of Texture2D*option<RenderTargetView>*option<ShaderResourceView>
-    type Surface = 
-        | Rgba32 of Rgba32
-        | Rgb32 of Rgb32
+    type R32 = 
+        | DxR32 of Texture2D*option<RenderTargetView>*option<ShaderResourceView>
 module input = 
     open SharpDX.DirectInput
     type Key = | W | A | S | D
@@ -260,13 +274,14 @@ open input
 [<EntryPoint>]
 let main argv = 
 
+    let sampleDesc = new SampleDescription(8, 0)
     let models = objAsset "../../asset_obj/sponza.obj"
     //let models = objAsset "../../nff/sphere.nff"
 
     let window = new RenderForm("drawlib!")
     window.MaximumSize <- new Drawing.Size(800,800)
     window.MinimumSize <- new Drawing.Size(800,800)
-    let (device, swapChain) = deviceAndSwapChain window
+    let (device, swapChain) = deviceAndSwapChain window sampleDesc
     let (backbuffer, backbufferRtv) = prepareWindow window device swapChain
     let simpleVs, vsByteCode = vs device "MiniTri.fx"
     let simplePs, _ = ps device "MiniTri.fx"
@@ -286,6 +301,8 @@ let main argv =
         AmbientLight {Color=Rgb(0.8f, 0.6f, 0.9f); Intensity=1.0f}
     |]
     
+    let (depth, dsv) = depthTex device (size window) sampleDesc
+
     let vpCb = cb device sizeof<Matrix>
 
     let cam = ref {Camera.Eye={x=0.f;y=0.f;z= -1.f}; 
@@ -305,8 +322,7 @@ let main argv =
     let sPressed = myKeyPressed Key.S
 
     RenderLoop.Run(window, (fun () ->    
-            let clearColor = new Color4(Color.Black.ToColor3())
-            immediateCtx.ClearRenderTargetView(backbufferRtv, clearColor)
+            clear immediateCtx [|backbufferRtv|] dsv
 
             if wPressed() then cam := move !cam {x=0.02f;y=0.02f;z= 0.02f}
             if sPressed() then cam := move !cam {x= -0.02f;y= -0.02f;z= -0.02f}
@@ -319,7 +335,7 @@ let main argv =
                         
                 prepareInputAssembler immediateCtx myLayout vb ib
                 prepareRasterizer immediateCtx (sizef window) 
-                prepareOutputMerger immediateCtx backbufferRtv
+                prepareOutputMerger immediateCtx backbufferRtv (Some dsv)
                 prepareVs immediateCtx simpleVs [|vpCb|]
                 preparePs immediateCtx simplePs [||]
 
