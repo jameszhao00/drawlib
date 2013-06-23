@@ -10,21 +10,44 @@ open SharpDX.Direct3D11
 open SharpDX.DXGI
 open SharpDX.Windows
 open Assimp
+module libcolor = 
+    type Color = 
+        | Rgb of float32*float32*float32
+        | Hsv of float32*float32*float32
         
-                                 
+    let toRgb color = 
+        match color with
+        | Rgb(_,_,_) -> color
+        | Hsv(_,_,_) -> failwith "not implemented"
+        
 module lib3d = 
     type vec4 = {x:float32; y:float32; z:float32; w:float32}
     type vec3 = {x:float32; y:float32; z:float32}
-    type View = {Eye:vec3; Forward:vec3; Up:vec3}
-    type Proj = {Fov:float32; AR:float32; ZNear:float32; ZFar:float32}
-   
+    type Camera = {Eye:vec3; Forward:vec3; Up:vec3; Fov:float32; AR:float32; ZNear:float32; ZFar:float32}
+    type PositionDirection = {Position : vec3; Direction: vec3}
+    
     let toNativeVec3 ({vec3.x=x; y=y; z=z}) = new Vector3(x,y,z)
     let toNativeVec4 ({vec4.x=x; y=y; z=z; w=w}) = new Vector4(x,y,z,w)
-    let view {Eye=eye; Forward=forward; Up=up} = 
+    let toMyVec3 (v:Vector3) = {vec3.x=v.X; y=v.Y; z=v.Z}
+    let viewMatrix {Eye=eye; Forward=forward; Up=up} = 
         Matrix.LookAtLH(toNativeVec3(eye), Vector3.Add(toNativeVec3(eye), toNativeVec3(forward)), toNativeVec3(up))
-    let proj {Fov=fov; AR=ar; ZNear=zNear; ZFar=zFar} = Matrix.PerspectiveFovLH(fov, ar, zNear, zFar)
-    let viewProj viewData projData = Matrix.Multiply((view viewData), (proj projData))
+    let projMatrix {Fov=fov; AR=ar; ZNear=zNear; ZFar=zFar} = Matrix.PerspectiveFovLH(fov, ar, zNear, zFar)
+
+    let viewProjMatrix cam = Matrix.Multiply((viewMatrix cam), (projMatrix cam))
     
+    let move cam dp = 
+        let newPosition = Vector3.Add((toNativeVec3 cam.Eye),(toNativeVec3 dp))
+        {cam with Eye = toMyVec3 newPosition}
+        
+    
+    
+module lighting = 
+    open lib3d
+    open libcolor
+    type Radiance = {Color:Color; Intensity:float32} //is it really called radiance?
+    type Light = 
+        | DirectionalLight of PositionDirection * Radiance
+        | AmbientLight of Radiance
 module assets = 
     open lib3d
     type Geometry = { Indices: uint32[]; Vertices : vec3[] }
@@ -48,7 +71,8 @@ module d3d =
         Format : Format;
         AlignedByteOffset : int;
         Slot : int;
-    }
+    }    
+
     type VertexBuffer = { DxBuffer : Buffer; Stride: int32; Offset: int32; VertexCount : int32 }
     type IndexBuffer = { DxBuffer: Buffer; Stride: int32; Offset: Int32; IndicesCount: int32; Format : Format }
     type CBuffer = { DxBuffer: Buffer; }
@@ -72,7 +96,7 @@ module d3d =
             ModeDescription = modeDesc,
             IsWindowed = sdx_true,
             OutputHandle = window.Handle,
-            SampleDescription = new SampleDescription(1, 0),
+            SampleDescription = new SampleDescription(8, 0),
             SwapEffect = SwapEffect.Discard,
             Usage = Usage.RenderTargetOutput
             )
@@ -158,8 +182,51 @@ module d3d =
         
     let preparePs (ctx : DeviceContext) ps cbs = 
         prepareShader ctx.PixelShader.Set (fun x -> ctx.PixelShader.SetConstantBuffers(0, x)) ps cbs
-        
+module gfx = 
+    open d3d
+    type Rgba32 = 
+        | DxRgba32 of Texture2D*option<RenderTargetView>*option<ShaderResourceView>
+    type Rgb32 = 
+        | DxRgb32 of Texture2D*option<RenderTargetView>*option<ShaderResourceView>
+    type Surface = 
+        | Rgba32 of Rgba32
+        | Rgb32 of Rgb32
+module input = 
+    open SharpDX.DirectInput
+    type Key = | W | A | S | D
+    let keyMap = [| 
+        A, DirectInput.Key.A;
+        S, DirectInput.Key.S;
+        W, DirectInput.Key.W;
+        D, DirectInput.Key.D;
+    |]
+    let toKey (key:DirectInput.Key) = 
+        keyMap |> Array.tryPick (fun (myKey, dxKey) -> match dxKey with | k when k = key -> Some myKey | _ -> None)
 
+    let pollingInput (form:System.Windows.Forms.Form) = 
+        let di = new DirectInput()
+        let kb = new Keyboard(di)
+        let mouse = new Mouse(di)   
+        let init () = 
+            kb.SetCooperativeLevel(form, CooperativeLevel.Foreground ||| CooperativeLevel.NonExclusive)
+            mouse.SetCooperativeLevel(form, CooperativeLevel.Foreground ||| CooperativeLevel.NonExclusive)
+            mouse.Acquire()        
+            kb.Acquire()
+        let kbFunc () = kb.GetCurrentState().PressedKeys.ToArray() |> Array.map toKey |> Array.choose id
+        let mousePos = ref (0, 0)
+        let mouseFunc () = 
+            let state = mouse.GetCurrentState()
+            let dx, dy = state.X - fst(!mousePos), state.Y - snd(!mousePos)
+            mousePos := (state.X, state.Y)
+            (dx, dy)
+        kbFunc, mouseFunc, init
+    let keyPressed (poller:unit->Key[]) (key:Key) () = poller () |> Array.exists (fun x -> x = key)
+
+
+module render = 
+    open gfx
+    type GBuffer = {Albedo: Rgb32; Normal: Rgb32;}
+    
 open lib3d
 open d3d
 
@@ -168,12 +235,17 @@ let myInputElements = [
     {Name = "COLOR"; Index = 0; Format = Format.R32G32B32A32_Float; Slot = 0; AlignedByteOffset = 16}
 ]
 open assets
+open lighting
+open libcolor
+open input
 [<EntryPoint>]
 let main argv = 
 
-    let sphere = objAsset "../../nff/sphere.nff"
+    let sphere = objAsset "../../asset_obj/sponza.obj"
 
     let window = new RenderForm("drawlib!")
+    window.MaximumSize <- new Drawing.Size(800,800)
+    window.MinimumSize <- new Drawing.Size(800,800)
     let (device, swapChain) = deviceAndSwapChain window
     let (backbuffer, backbufferRtv) = prepareWindow window device swapChain
     let simpleVs, vsByteCode = vs device "MiniTri.fx"
@@ -186,21 +258,36 @@ let main argv =
     let myLayout = layout device vsByteCode myInputElements 
     let immediateCtx = device.ImmediateContext
     
+    let lights = [|
+        AmbientLight {Color=Rgb(0.8f, 0.6f, 0.9f); Intensity=1.0f}
+    |]
     
     let vpCb = cb device sizeof<Matrix>
 
+    let cam = ref {Camera.Eye={x=0.f;y=100.f;z= -1.f}; 
+        Forward={x=0.f;y=0.f;z=1.f};
+        Up={x=0.f;y=1.f;z=0.f;};
+        Fov = 3.14f / 2.f;
+        AR = 1.f;
+        ZNear = 0.01f;
+        ZFar = 10000.f
+    }
 
-    let eyeZ = ref -1.f
+    let pollKb, pollMouse, pollInit = pollingInput window
+    window.Show()
+    pollInit ()
+    let myKeyPressed = keyPressed pollKb
+    let wPressed = myKeyPressed Key.W
+    let sPressed = myKeyPressed Key.S
 
-
-    RenderLoop.Run(window, (fun () ->                 
+    RenderLoop.Run(window, (fun () ->    
             let clearColor = new Color4(Color.Black.ToColor3())
             immediateCtx.ClearRenderTargetView(backbufferRtv, clearColor)
-            
-            eyeZ := !eyeZ + 0.00001f
-            let v = {Eye={x=0.f;y=0.f;z = !eyeZ}; Forward={x=0.f;y=0.f;z=1.f}; Up={x=0.f;y=1.f;z=0.f}}
-            let p = {ZNear = 0.01f; ZFar = 10.f; AR = 1.f; Fov = SharpDX.MathUtil.PiOverTwo}
-            let vpMat = viewProj v p
+
+            if wPressed() then cam := move !cam {x=0.f;y=0.f;z= 0.02f}
+            if sPressed() then cam := move !cam {x=0.f;y=0.f;z= -0.02f}
+
+            let vpMat = viewProjMatrix !cam
 
             updateCb immediateCtx vpCb vpMat
 
