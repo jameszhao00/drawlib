@@ -76,7 +76,7 @@ module assets =
 module d3d = 
     open lib3d
     open assets
-    let vertexByteSize = StrideInBytes(uint32(4 (* vec4 *) * 4 (* sizeof(float) *) * 2 (* pos *)))
+    let vertexByteSize = StrideInBytes(uint32(3 (* vec3 *) * 4 (* sizeof(float) *) * 2 (* pos *)))
     type VsInputElement = { 
         Name: string; 
         Index : int;
@@ -250,8 +250,8 @@ open lib3d
 open d3d
 
 let myInputElements = [
-    {Name = "POSITION"; Index = 0; Format = Format.R32G32B32A32_Float; Slot = 0; AlignedByteOffset = 0} 
-    {Name = "NORMAL"; Index = 0; Format = Format.R32G32B32A32_Float; Slot = 0; AlignedByteOffset = 16}
+    {Name = "POSITION"; Index = 0; Format = Format.R32G32B32_Float; Slot = 0; AlignedByteOffset = InputElement.AppendAligned} 
+    {Name = "NORMAL"; Index = 0; Format = Format.R32G32B32_Float; Slot = 0; AlignedByteOffset = InputElement.AppendAligned}
 ]
 open assets
 open lighting
@@ -275,7 +275,7 @@ let main argv =
     let flattenVertex (vertices:Vertex[]) = 
         vertices 
         |> Array.collect (fun {Position={x=px;y=py;z=pz};Normal={x=nx;y=ny;z=nz}} -> 
-            [|px;py;pz;1.0f;nx;ny;nz;0.0f;|]) 
+            [|px;py;pz;nx;ny;nz;|]) 
     
     let ibVbs = models |> Array.map (fun x -> triVertexBuffer device (flattenVertex x.Vertices) vertexByteSize x.Indices)
     printfn "end making ib, vb"
