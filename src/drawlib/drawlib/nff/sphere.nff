@@ -1,3 +1,6 @@
 --- begin of file
 s 0 0 0 .1
+s -.3 0 0 .1
+s .3 0 0 .1
+--- hex -7 0 0 .002
 --- end of file
