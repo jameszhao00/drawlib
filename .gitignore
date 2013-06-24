@@ -19,3 +19,22 @@ packages/
 /src/drawlib/drawlib/obj/Debug/*.cache
 
 
+
+
+/src/drawlib/drawlib/bin/Release/*.dll
+/src/drawlib/drawlib/bin/Release/*.pdb
+/src/drawlib/drawlib/bin/Release/*.exe
+/src/drawlib/drawlib/bin/Release/*.xml
+/src/drawlib/drawlib/bin/Release/*.config
+/src/drawlib/drawlib/bin/Release/*.fx
+
+
+/src/drawlib/drawlib/obj/Release/*.dll
+/src/drawlib/drawlib/obj/Release/*.pdb
+/src/drawlib/drawlib/obj/Release/*.exe
+/src/drawlib/drawlib/obj/Release/*.xml
+/src/drawlib/drawlib/obj/Release/*.config
+/src/drawlib/drawlib/obj/Release/*.fx
+/src/drawlib/drawlib/obj/Release/*.txt
+/src/drawlib/drawlib/obj/Release/*.cache
+

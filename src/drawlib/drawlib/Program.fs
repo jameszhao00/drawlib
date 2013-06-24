@@ -10,6 +10,43 @@ open SharpDX.Direct3D11
 open SharpDX.DXGI
 open SharpDX.Windows
 open Assimp
+
+module input = 
+    open SharpDX.DirectInput
+    type Key = | W | A | S | D
+    let keyMap = [| 
+        A, DirectInput.Key.A;
+        S, DirectInput.Key.S;
+        W, DirectInput.Key.W;
+        D, DirectInput.Key.D;
+    |]
+    let toKey (key:DirectInput.Key) = 
+        keyMap |> Array.tryPick (fun (myKey, dxKey) -> match dxKey with | k when k = key -> Some myKey | _ -> None)
+
+    let pollingInput (form:System.Windows.Forms.Form) = 
+        let di = new DirectInput()
+        let kb = new Keyboard(di)
+        let mouse = new Mouse(di)   
+        let init () = 
+            kb.SetCooperativeLevel(form, CooperativeLevel.Foreground ||| CooperativeLevel.NonExclusive)
+            mouse.SetCooperativeLevel(form, CooperativeLevel.Foreground ||| CooperativeLevel.NonExclusive)
+            mouse.Acquire()        
+            kb.Acquire()
+        let kbFunc () = 
+            try kb.GetCurrentState().PressedKeys.ToArray()
+            with _ -> [||]
+            |> Array.map toKey |> Array.choose id
+        let mousePos = ref (0, 0)
+        let mouseFunc () = 
+            try 
+                let state = mouse.GetCurrentState()
+                let dx, dy = state.X - fst(!mousePos), state.Y - snd(!mousePos)
+                mousePos := (state.X, state.Y)
+                (dx, dy)
+            with _ -> (0, 0)
+        kbFunc, mouseFunc, init
+    let keyPressed (poller:unit->Key[]) (key:Key) () = poller () |> Array.exists (fun x -> x = key)
+
 module libcolor = 
     type Color = 
         | Rgb of float32*float32*float32
@@ -60,12 +97,11 @@ module assets =
     type Geometry = { Indices: uint32[]; Vertices : Vertex[] }
     
 
-    let objAsset path = 
-        let importer = new AssimpImporter()        
-        let importedAsset = importer.ImportFile(path, PostProcessSteps.Triangulate
-            //||| PostProcessSteps.GenerateNormals
+    let loadAsset path auxFlags =         
+        let importer = new AssimpImporter()   
+        let importedAsset = importer.ImportFile(path, PostProcessSteps.Triangulate            
             ||| PostProcessSteps.PreTransformVertices 
-            )        
+            ||| auxFlags)               
         importedAsset.Meshes 
         |> Array.map (
             fun mesh -> 
@@ -99,12 +135,37 @@ module d3d =
 
     let size (window : System.Windows.Forms.Form) = 
         (window.ClientSize.Width, window.ClientSize.Height)
-
-    let depthTex (device:SharpDX.Direct3D11.Device) (w, h) (samples:SampleDescription) = 
-        let desc = new Texture2DDescription(Width = w, Height=h, Format=Format.D32_Float,
-                    SampleDescription=samples, Usage=ResourceUsage.Default, BindFlags=BindFlags.DepthStencil, ArraySize=1, MipLevels=1)
+    
+    let rtSurface (device:SharpDX.Direct3D11.Device) (w, h) (samples:SampleDescription) (format:Format) = 
+        let desc = new Texture2DDescription(Width = w, Height=h, Format=format,
+                    SampleDescription=samples, Usage=ResourceUsage.Default, BindFlags=(BindFlags.RenderTarget|||BindFlags.ShaderResource), 
+                    ArraySize=1, MipLevels=1)
         let tex = new Texture2D(device, desc)
-        tex, new DepthStencilView(device, tex)
+        tex, new RenderTargetView(device, tex), new ShaderResourceView(device, tex)
+
+    
+
+    let depthSurface (device:SharpDX.Direct3D11.Device) (w, h) (samples:SampleDescription) =     
+        let texDesc = new Texture2DDescription(Width = w, Height=h, Format=Format.R32_Typeless,
+                        SampleDescription=samples, Usage=ResourceUsage.Default, 
+                        BindFlags=(BindFlags.DepthStencil|||BindFlags.ShaderResource), 
+                        ArraySize=1, MipLevels=1)
+        let tex = new Texture2D(device, texDesc)
+
+        let dsvDimension, srvDimension = 
+            match samples.Count with
+            | 1 -> DepthStencilViewDimension.Texture2D, ShaderResourceViewDimension.Texture2D
+            | _ -> DepthStencilViewDimension.Texture2DMultisampled, ShaderResourceViewDimension.Texture2DMultisampled
+
+        let dsvDesc = DepthStencilViewDescription(Format=Format.D32_Float,
+                            Flags = DepthStencilViewFlags.None,
+                            Dimension= dsvDimension)
+        
+        let srvDesc = ShaderResourceViewDescription(Format=Format.R32_Float,
+                            Dimension= srvDimension,
+                            Texture2D=ShaderResourceViewDescription.Texture2DResource(MipLevels=1))
+            
+        tex, new DepthStencilView(device, tex, dsvDesc), new ShaderResourceView(device, tex, srvDesc)
 
     let swapChainDesc window sampleDesc = 
         let (w, h) = size window
@@ -184,11 +245,14 @@ module d3d =
     let prepareRasterizer (ctx:DeviceContext) (w,h)= 
         ctx.Rasterizer.SetViewport(0.f, 0.f, w, h, 0.f, 1.f)
 
-    let prepareOutputMerger (ctx:DeviceContext) (rtv:RenderTargetView) (dsv:option<DepthStencilView>) = 
+    let prepareOutputMerger (ctx:DeviceContext) (rtv:RenderTargetView[]) (dsv:option<DepthStencilView>) = 
         match dsv with 
         | Some x -> ctx.OutputMerger.SetTargets(x, rtv)
         | None -> ctx.OutputMerger.SetTargets(rtv)
-        
+    let clearOutputs ctx = prepareOutputMerger ctx [|null; null; null; null|] (Some null)
+    let clearResources (ctx:Direct3D11.DeviceContext) = 
+        ctx.VertexShader.SetShaderResources(0, [|null; null; null; null; null; null; null|])
+        ctx.PixelShader.SetShaderResources(0, [|null; null; null; null; null; null; null|])
 
     let updateCb (ctx:DeviceContext) (buf:CBuffer) data = 
         ctx.UpdateSubresource(ref data, buf.DxBuffer)
@@ -200,83 +264,209 @@ module d3d =
         let backbufferRtv = rtv device backbuffer
         (backbuffer, backbufferRtv)
 
-    let prepareShader setShader setCbs shader (cbs:CBuffer[]) = 
+    let prepareShader setShader setCbs setSrvs shader (cbs:CBuffer[]) (srvs:ShaderResourceView[])= 
         setShader shader
         if cbs.Length > 0 then
             setCbs (cbs |> Array.map (fun x -> x.DxBuffer))
+        if srvs.Length > 0 then
+            setSrvs srvs
 
-    let prepareVs (ctx : DeviceContext) vs cbs = 
-        prepareShader ctx.VertexShader.Set (fun x -> ctx.VertexShader.SetConstantBuffers(0, x)) vs cbs
+    let prepareVs (ctx : DeviceContext) vs cbs srvs = 
+        prepareShader ctx.VertexShader.Set 
+            (fun x -> ctx.VertexShader.SetConstantBuffers(0, x)) (fun x -> ctx.VertexShader.SetShaderResources(0, x))
+            vs cbs srvs
         
-    let preparePs (ctx : DeviceContext) ps cbs = 
-        prepareShader ctx.PixelShader.Set (fun x -> ctx.PixelShader.SetConstantBuffers(0, x)) ps cbs
+    let preparePs (ctx : DeviceContext) ps cbs srvs = 
+        prepareShader ctx.PixelShader.Set 
+            (fun x -> ctx.PixelShader.SetConstantBuffers(0, x)) (fun x -> ctx.PixelShader.SetShaderResources(0, x))
+            ps cbs srvs
+
 module gfx = 
     open d3d
+    type ReadSurface = Texture2D * ShaderResourceView
+    type WriteSurface = Texture2D * RenderTargetView
+    type Backbuffer = Backbuffer of WriteSurface
+    type ReadWriteSurface = Texture2D * ShaderResourceView * RenderTargetView
+    type DepthSurface = Texture2D * ShaderResourceView * DepthStencilView 
 
-    type Rgba32 = 
-        | DxRgba32 of Texture2D*option<RenderTargetView>*option<ShaderResourceView>
-    type Rgb32 = 
-        | DxRgb32 of Texture2D*option<RenderTargetView>*option<ShaderResourceView>
-    type R32 = 
-        | DxR32 of Texture2D*option<RenderTargetView>*option<ShaderResourceView>
-module input = 
-    open SharpDX.DirectInput
-    type Key = | W | A | S | D
-    let keyMap = [| 
-        A, DirectInput.Key.A;
-        S, DirectInput.Key.S;
-        W, DirectInput.Key.W;
-        D, DirectInput.Key.D;
-    |]
-    let toKey (key:DirectInput.Key) = 
-        keyMap |> Array.tryPick (fun (myKey, dxKey) -> match dxKey with | k when k = key -> Some myKey | _ -> None)
+    type GfxSystem = {Device:SharpDX.Direct3D11.Device; Context:SharpDX.Direct3D11.DeviceContext}
+    type Msaa = Msaa of int
+        
+    type VertexShaderState = {
+        Shader: VertexShader;
+        Resources: ShaderResourceView[];
+        Constants: CBuffer[];
+        InputLayout : InputLayout;
+    }
+    type PixelShaderState = {
+        Shader: PixelShader;
+        Resources: ShaderResourceView[];
+        Constants: CBuffer[];
+    }
+    type OutputState = {    
+        Depth: option<DepthStencilView>;
+        RenderTargets: RenderTargetView[];
+        Size: float32*float32
+    }
+    type PipelineState = {
+        VertexShader: VertexShaderState;
+        PixelShader: PixelShaderState;
+        Output: OutputState;
+        VertexBuffer : VertexBuffer;
+        IndexBuffer : IndexBuffer;  
+    }
+    
+    type DrawOperation = {
+        State : PipelineState;      
+    }
+    
+    let applyState system state = 
+        clearOutputs system.Context
+        clearResources system.Context
 
-    let pollingInput (form:System.Windows.Forms.Form) = 
-        let di = new DirectInput()
-        let kb = new Keyboard(di)
-        let mouse = new Mouse(di)   
-        let init () = 
-            kb.SetCooperativeLevel(form, CooperativeLevel.Foreground ||| CooperativeLevel.NonExclusive)
-            mouse.SetCooperativeLevel(form, CooperativeLevel.Foreground ||| CooperativeLevel.NonExclusive)
-            mouse.Acquire()        
-            kb.Acquire()
-        let kbFunc () = 
-            try kb.GetCurrentState().PressedKeys.ToArray()
-            with _ -> [||]
-            |> Array.map toKey |> Array.choose id
-        let mousePos = ref (0, 0)
-        let mouseFunc () = 
-            try 
-                let state = mouse.GetCurrentState()
-                let dx, dy = state.X - fst(!mousePos), state.Y - snd(!mousePos)
-                mousePos := (state.X, state.Y)
-                (dx, dy)
-            with _ -> (0, 0)
-        kbFunc, mouseFunc, init
-    let keyPressed (poller:unit->Key[]) (key:Key) () = poller () |> Array.exists (fun x -> x = key)
+        let {VertexShaderState.Shader=vs; Resources=vsResources; Constants=vsCb; InputLayout=il} = state.VertexShader
+        let {PixelShaderState.Shader=ps; Resources=psResources; Constants=psCb} = state.PixelShader
+        let {Depth=depth; RenderTargets=rtvs; Size=size} = state.Output
+        let vb, ib = state.VertexBuffer, state.IndexBuffer
+        let {Device=device; Context=ctx} = system
 
+        prepareInputAssembler ctx il vb ib
+        prepareVs ctx vs vsCb vsResources
+        preparePs ctx ps psCb psResources
+        prepareRasterizer ctx size 
+        prepareOutputMerger ctx rtvs depth        
+
+    //this api abstraction system is very leaky... refactor needed if we want ogl
+    //we ideally want a api independent way to specify a draw op, and then conver that to api specific draw op
+    //for now it's all prototype so fine
+    let draw system (drawop:DrawOperation) = 
+        applyState system drawop.State
+        let _, ib = drawop.State.VertexBuffer, drawop.State.IndexBuffer
+        let {Device=device; Context=ctx} = system
+        ctx.DrawIndexed(int(ib.IndicesCount), 0, 0)
+            
+            
+    let dxSampleDesc (Msaa msaaCount) = (new SampleDescription(msaaCount, 0))
+
+    let makeRgba16 {Device=device} size msaa = 
+        let tex, rtv, srv = rtSurface device size (dxSampleDesc msaa) Format.R16G16B16A16_Float
+        tex, srv, rtv
+    let makeD32 {Device=device} size msaa = 
+        let tex, dsv, srv = depthSurface device size (dxSampleDesc msaa) 
+        tex, srv, dsv
+               
+module quad = 
+   open d3d 
+   open lib3d
+   let quadInputElements = [|
+        {Name = "POSITION"; Index = 0; Format = Format.R32G32B32_Float; Slot = 0; AlignedByteOffset = InputElement.AppendAligned} 
+   |]
+   let quadVertices = 
+       [|
+            -1; 1; 0; //upper left
+            1; 1; 0; //upper right
+            1; -1; 0; //lower right
+            -1; -1; 0; //lower left
+       |] 
+       |> Array.map (fun x -> float32(x)) 
+   let quadIndices = [|0; 1; 2; 2; 3; 0|] |> Array.map (fun x -> uint32(x))
+   let quadVbIb device = 
+        triVertexBuffer device quadVertices (StrideInBytes(uint32(3 * 4))) quadIndices
+   let quadInputLayout device vsBytecode = layout device vsBytecode quadInputElements     
 
 module render = 
     open gfx
-    type GBuffer = {Albedo: Rgb32; Normal: Rgb32;}    
+    open lib3d
+    open d3d //not really well isolated atm... but that's fine
+    open quad
+    type GBuffer = {Albedo: ReadWriteSurface; Normal: ReadWriteSurface; Depth: DepthSurface}  
+
+    type ShaderState = { VertexShader: VertexShader; PixelShader:PixelShader; InputLayout:InputLayout}
+    type GenGBuferCBuffers = {ViewProjCb : CBuffer}
+    type ShadeGBufferQuad = { VertexBuffer: VertexBuffer; IndexBuffer: IndexBuffer}
+    type GBufferShaderState = { GenGBuffer: ShaderState * GenGBuferCBuffers; ShadeGBuffer: ShaderState*ShadeGBufferQuad}
+    
+    
+    let gbufferInputElements = [
+        {Name = "POSITION"; Index = 0; Format = Format.R32G32B32_Float; Slot = 0; AlignedByteOffset = InputElement.AppendAligned} 
+        {Name = "NORMAL"; Index = 0; Format = Format.R32G32B32_Float; Slot = 0; AlignedByteOffset = InputElement.AppendAligned}
+    ]
+    let clear (ctx:DeviceContext) {Albedo=(_,_,albedoRtv); Normal=(_,_,normalRtv); Depth=(_,_,dsv)} =
+        clear ctx [|albedoRtv; normalRtv|] dsv
+    let makeGBufferState device = 
+        let genGBufferShaderState = 
+            let vs, vsBytecode = vs device "genGBuffer.fx"
+            { ShaderState.VertexShader = vs
+              PixelShader = fst (ps device "genGBuffer.fx")
+              InputLayout = layout device vsBytecode gbufferInputElements
+            }, {ViewProjCb = cb device sizeof<Matrix>}
+        let shadeGBufferShaderState = 
+            let vs, vsBytecode = vs device "shadeGBuffer.fx"
+            let ib, vb = quadVbIb device
+            { ShaderState.VertexShader = vs
+              PixelShader = fst (ps device "shadeGBuffer.fx")
+              InputLayout = quadInputLayout device vsBytecode
+            }, {VertexBuffer = vb; IndexBuffer = ib}
+        {GenGBuffer = genGBufferShaderState; ShadeGBuffer = shadeGBufferShaderState}
+            
+
+    let makeGBuffer system size msaa = 
+        {Albedo=makeRgba16 system size msaa; 
+        Normal=makeRgba16 system size msaa; 
+        Depth=makeD32 system size msaa}
+
+    let genGBufferPass system {Albedo=(_,_,albedoRtv); Normal=(_,_,normalRtv); Depth=(depthTex, _, dsv)} 
+        //WILL MODIFY the cbuffer!!!
+        {GenGBuffer={VertexShader=vs; PixelShader=ps; InputLayout=il}, {ViewProjCb=vpCb}} size cam (vb, ib) = 
+        let vpMat = viewProjMatrix cam        
+        updateCb system.Context vpCb vpMat        
+
+        let pipelineState = { 
+                        VertexShader = { Shader = vs; Resources = [||]; Constants = [|vpCb|]; InputLayout = il; };
+                        PixelShader = { Shader = ps; Resources = [||]; Constants = [||]; };                    
+                        Output = { 
+                                    Depth = Some dsv;
+                                    RenderTargets = [|albedoRtv; normalRtv|];
+                                    Size = size;
+                        };
+                        VertexBuffer = vb; 
+                        IndexBuffer = ib
+                }
+        draw system { State = pipelineState; }
+
+    let shadeGBufferPass system {Albedo=(_,albedoSrv,_); Normal=(_,normalSrv,_);} 
+        {ShadeGBuffer={VertexShader=vs; PixelShader=ps; InputLayout=il}, {VertexBuffer=vb; IndexBuffer=ib}}
+        (Backbuffer(_,backBufferRtv)) size =       
+          
+        let pipelineState = { 
+                        VertexShader = { Shader = vs; Resources = [||]; Constants = [||]; InputLayout = il; };
+                        PixelShader = { Shader = ps; Resources = [|albedoSrv; normalSrv|]; Constants = [||]; };                    
+                        Output = { Depth = None; RenderTargets = [|backBufferRtv|]; Size = size; };
+                        VertexBuffer = vb; 
+                        IndexBuffer = ib;
+                }
+        draw system { State = pipelineState; }
+                
     
 open lib3d
 open d3d
-
-let myInputElements = [
-    {Name = "POSITION"; Index = 0; Format = Format.R32G32B32_Float; Slot = 0; AlignedByteOffset = InputElement.AppendAligned} 
-    {Name = "NORMAL"; Index = 0; Format = Format.R32G32B32_Float; Slot = 0; AlignedByteOffset = InputElement.AppendAligned}
-]
 open assets
 open lighting
 open libcolor
 open input
+open gfx
+open render
 [<EntryPoint>]
 let main argv = 
 
-    let sampleDesc = new SampleDescription(8, 0)
-    let models = objAsset "../../asset_obj/sponza.obj"
-    //let models = objAsset "../../nff/sphere.nff"
+    //TODO: keep in sync
+    let sampleDesc = new SampleDescription(1, 0)
+    let msaa = Msaa 1
+
+
+    //let models, moveSpeed = loadAsset "../../asset_obj/sponza.obj" PostProcessSteps.None, 0.2f
+    let models, moveSpeed = loadAsset "../../nff/sphere.nff" PostProcessSteps.GenerateSmoothNormals, 0.0002f
+
 
     let window = new RenderForm("drawlib!")
     window.MaximumSize <- new Drawing.Size(800,800)
@@ -294,17 +484,12 @@ let main argv =
     
     let ibVbs = models |> Array.map (fun x -> triVertexBuffer device (flattenVertex x.Vertices) vertexByteSize x.Indices)
     printfn "end making ib, vb"
-    let myLayout = layout device vsByteCode myInputElements 
     let immediateCtx = device.ImmediateContext
     
     let lights = [|
         AmbientLight {Color=Rgb(0.8f, 0.6f, 0.9f); Intensity=1.0f}
-    |]
+    |]   
     
-    let (depth, dsv) = depthTex device (size window) sampleDesc
-
-    let vpCb = cb device sizeof<Matrix>
-
     let cam = ref {Camera.Eye={x=0.f;y=0.f;z= -1.f}; 
         Forward={x=0.f;y=0.f;z=1.f};
         Up={x=0.f;y=1.f;z=0.f;};
@@ -313,33 +498,30 @@ let main argv =
         ZNear = 0.1f;
         ZFar = 10000.f
     }
-
     let pollKb, pollMouse, pollInit = pollingInput window
     window.Show()
     pollInit ()
     let myKeyPressed = keyPressed pollKb
     let wPressed = myKeyPressed Key.W
     let sPressed = myKeyPressed Key.S
-
+    let aPressed = myKeyPressed Key.A
+    let dPressed = myKeyPressed Key.D
+    let system = {Device=device; Context=immediateCtx;}
+    let gbufferState = makeGBufferState device
+    let gbuffer = makeGBuffer system (size window) msaa
     RenderLoop.Run(window, (fun () ->    
-            clear immediateCtx [|backbufferRtv|] dsv
+            let _,_,dsv = gbuffer.Depth
+            render.clear immediateCtx gbuffer
 
-            if wPressed() then cam := move !cam {x=0.02f;y=0.02f;z= 0.02f}
-            if sPressed() then cam := move !cam {x= -0.02f;y= -0.02f;z= -0.02f}
+            if wPressed() then cam := move !cam {x=0.f;y=0.f;z=moveSpeed}
+            if sPressed() then cam := move !cam {x=0.f;y=0.f;z= -moveSpeed}
+            if aPressed() then cam := move !cam {x= -moveSpeed;y=0.f;z=0.f}
+            if dPressed() then cam := move !cam {x=moveSpeed;y=0.f;z=0.f}
 
-            let vpMat = viewProjMatrix !cam
+            for (ib, vb) in ibVbs do                         
+                genGBufferPass system gbuffer gbufferState (sizef window) !cam (vb, ib)
 
-            updateCb immediateCtx vpCb vpMat
-
-            for (ib, vb) in ibVbs do  
-                        
-                prepareInputAssembler immediateCtx myLayout vb ib
-                prepareRasterizer immediateCtx (sizef window) 
-                prepareOutputMerger immediateCtx backbufferRtv (Some dsv)
-                prepareVs immediateCtx simpleVs [|vpCb|]
-                preparePs immediateCtx simplePs [||]
-
-                immediateCtx.DrawIndexed(int(ib.IndicesCount), 0, 0)
+            shadeGBufferPass system gbuffer gbufferState (Backbuffer(backbuffer, backbufferRtv)) (sizef window)             
             swapChain.Present(0, PresentFlags.None)            
         ))
         
